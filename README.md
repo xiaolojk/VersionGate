@@ -24,6 +24,8 @@
 
 插件基于 Endstone Python API 编写，**无需编译、无需额外依赖**，一个 `.whl` 文件丢进 `plugins/` 即可使用。
 
+> 💻 **完全开源**：本项目**全部源代码**都在本仓库 `src/` 目录下，采用 MIT 许可，可自由查看、使用、修改与分发。Release 里的 `.whl` 只是打包产物，源码始终公开。
+
 ---
 
 ## ✨ 功能特性
@@ -136,9 +138,41 @@ debug = false
 
 ---
 
+## 💻 源代码
+
+**全部源码均已开源**，仓库即源码，可直接在线浏览或克隆：
+
+```
+src/endstone_versiongate/
+├── __init__.py       # 插件入口，导出 VersionGatePlugin
+├── versiongate.py    # 核心实现：协议号改写 + 进服通报（含完整中文注释）
+└── config.toml       # 默认配置文件
+```
+
+克隆到本地：
+
+```bash
+git clone https://github.com/xiaolojk/VersionGate.git
+```
+
+自行构建 `.whl`（可选）：
+
+```bash
+pip install build
+python -m build --wheel
+# 产物在 dist/ 目录，直接丢进 plugins/ 即可
+```
+
+---
+
 ## 📄 开源许可
 
-本项目采用 [MIT License](LICENSE) 开源，**可自由使用、修改、分发**，仅需保留版权声明。
+本项目采用 [MIT License](LICENSE) 开源，**可自由使用、修改、分发**，仅需保留版权声明。也就是说：
+
+- ✅ 商用、私用均可
+- ✅ 可修改源码二次开发
+- ✅ 可重新打包发布
+- ✅ 只需保留版权声明与许可文本
 
 基于 [Endstone](https://endstone.dev/) Python 插件 API 开发，协议号字段参考 [gophertunnel](https://github.com/Sandertv/gophertunnel) 的基岩版协议定义，在此致谢。
 
