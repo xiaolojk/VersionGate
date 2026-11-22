@@ -10,7 +10,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
 [![Version](https://img.shields.io/badge/version-v1.0.0-orange.svg)](https://github.com/xiaolojk/VersionGate/releases)
 
-<img src="assets/banner.png" alt="VersionGate 宣传图" width="100%" />
+<img src="https://raw.githubusercontent.com/xiaolojk/VersionGate/main/assets/banner.png" alt="VersionGate 宣传图" width="100%" />
 
 </div>
 
