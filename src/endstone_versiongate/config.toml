@@ -15,3 +15,7 @@ max_protocol_diff = 1400
 
 # 是否输出详细调试日志（排查版本问题时可开启）
 debug = false
+
+# 是否启用运行统计（缓存命中率/改写次数），禁用服务器关闭时输出汇总
+# 默认 false 以保证热路径零额外开销；需要观测优化效果时可改为 true
+enable_stats = false
