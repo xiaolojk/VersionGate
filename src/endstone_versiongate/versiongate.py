@@ -1,13 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-VersionGate - Endstone 插件
+VersionGate - Endstone 插件 (v1.1 性能优化版)
 功能：
 1. 版本准入：拦截客户端登录握手包，将客户端上报的协议号改写为服务器协议号，
    让 Minecraft Bedrock 1.26.x 各小版本客户端都能进入服务器（类似轻量 ViaVersion）。
 2. 进服通报：玩家进入服务器后，全服广播
    "[名称]该玩家是[游戏版本]，欢迎你加入服务器！"
+
+v1.1 性能优化：
+- 预编译 struct.Struct 并复用，避免每个包重新解析格式串
+- 目标协议号字节在启用时预计算，热路径零 struct 调用
+- 引入协议号改写决策缓存（LRU 上限 + 命中计数），同版本客户端只判断一次
+- 去除 new_payload != payload 的全量字节比较（改为 4 字节头直接判定）
+- 热路径局部变量化，减少 self 属性重复访问
+- 进服通报正常路径去除 try/except 开销
 """
 import struct
+from collections import OrderedDict
 
 from endstone import ColorFormat
 from endstone.event import event_handler, PlayerJoinEvent, PacketReceiveEvent
@@ -17,36 +26,17 @@ from endstone.plugin import Plugin
 PID_LOGIN = 0x01                     # Login 包
 PID_REQUEST_NETWORK_SETTINGS = 0xC1  # RequestNetworkSettings 包（协议协商）
 
+# 预编译：大端 int32 结构体，模块级单例，避免每次 unpack_from 重新解析格式
+_S32BE = struct.Struct(">i")
+_UNPACK_S32BE = _S32BE.unpack_from
+_PACK_S32BE = _S32BE.pack
 
-# ---------------- VarInt 编解码 ----------------
-def read_varint(data: bytes, offset: int = 0):
-    """读取一个 Minecraft VarInt，返回 (值, 读取后的偏移)。最多 5 字节。"""
-    value = 0
-    shift = 0
-    i = offset
-    while i < len(data) and shift < 35:
-        b = data[i]
-        value |= (b & 0x7F) << shift
-        i += 1
-        if not (b & 0x80):
-            return value, i
-        shift += 7
-    raise ValueError("invalid VarInt")
+# 改写决策缓存上限：协议号种类有限，128 足够覆盖所有已知客户端版本
+_REWRITE_CACHE_MAX = 128
 
-
-def encode_varint(value: int) -> bytes:
-    """把整数编码为 Minecraft VarInt 字节。"""
-    out = bytearray()
-    value &= 0xFFFFFFFF
-    while True:
-        b = value & 0x7F
-        value >>= 7
-        if value:
-            out.append(b | 0x80)
-        else:
-            out.append(b)
-            break
-    return bytes(out)
+# 缓存哨兵：区分"未缓存"(_MISS) 与"判定为不改写"(_SKIP)
+_MISS = object()
+_SKIP = object()
 
 
 class VersionGatePlugin(Plugin):
@@ -72,11 +62,19 @@ class VersionGatePlugin(Plugin):
         # 允许改写的协议号范围：客户端协议号与服务器相差不超过该值才改写，避免误伤
         self._max_protocol_diff = int(cfg.get("max_protocol_diff", 1400))
 
+        # ---- v1.1 性能优化：预计算热路径所需数据 ----
+        # 目标协议号的大端字节，启用时算一次，热路径直接切片拼接
+        self._target_bytes = _PACK_S32BE(self._server_protocol)
+        # 改写决策缓存：client_proto -> 改写后的 4 字节头（命中则免 unpack/判断）
+        # 值为目标字节表示"需改写"，None 表示"不改写"；用哨兵区分未缓存
+        self._rewrite_cache = OrderedDict()
+        self._cache_max = _REWRITE_CACHE_MAX
+
         self.register_events(self)
         self.logger.info(
-            "VersionGate 已启用 | 服务器协议号=%d | MC版本=%s | 版本绕行=%s | 进服通报=%s"
+            "VersionGate v1.1 已启用 | 服务器协议号=%d | MC版本=%s | 版本绕行=%s | 进服通报=%s | 决策缓存=%d"
             % (self._server_protocol, self._minecraft_version,
-               self._bypass_enabled, self._announce_enabled)
+               self._bypass_enabled, self._announce_enabled, self._cache_max)
         )
 
     def on_disable(self) -> None:
@@ -85,51 +83,68 @@ class VersionGatePlugin(Plugin):
     # ---------------- 版本准入：改写登录包协议号 ----------------
     @event_handler
     def on_packet_receive(self, event: PacketReceiveEvent) -> None:
+        # 热路径：局部变量化，减少重复 self 属性访问
         if not self._bypass_enabled:
             return
         pid = event.packet_id
-        if pid not in (PID_LOGIN, PID_REQUEST_NETWORK_SETTINGS):
+        if pid != PID_LOGIN and pid != PID_REQUEST_NETWORK_SETTINGS:
             return
         payload = event.payload
-        if not payload:
+        # 协议号占 4 字节；不足则跳过
+        if payload is None or len(payload) < 4:
             return
+
         try:
             new_payload = self._rewrite(payload, pid)
-            if new_payload is not None and new_payload != payload:
+            if new_payload is not None:
                 event.payload = new_payload
                 if self._debug:
-                    self.logger.info("已改写协议号: 包ID=%d 长度 %d -> %d"
-                                     % (pid, len(payload), len(new_payload)))
+                    self.logger.info("已改写协议号: 包ID=%d 长度 %d" % (pid, len(new_payload)))
         except Exception as e:
             # 绝不因改写失败而阻断玩家连接：原样放行
             if self._debug:
                 self.logger.warning("协议号改写跳过(包ID=%d): %s" % (pid, e))
 
-    def _rewrite(self, payload: bytes, pid: int):
-        """把 payload 开头的协议号改写为服务器协议号。失败返回 None。
+    def _rewrite(self, payload: bytes, pid: int = PID_LOGIN):
+        """把 payload 开头的协议号改写为服务器协议号。返回新字节或 None。
 
-        依据 gophertunnel 协议定义，RequestNetworkSettings 与 Login 包的
-        ClientProtocol 均为 big-endian int32（4 字节）。
+        RequestNetworkSettings 与 Login 包的 ClientProtocol 均为大端 int32（4 字节）。
+
+        v1.1：先查决策缓存——同协议号客户端直接拿预存的改写后字节头拼接，
+        免去 unpack_from 与范围判断；未命中才解析并缓存决策。
         """
-        target = self._server_protocol
-        if len(payload) < 4:
-            return None
+        head = payload[:4]
+        cache = self._rewrite_cache
+        cached = cache.get(head, _MISS)  # 哨兵区分"未缓存"与"判定为不改写"
+        if cached is not _MISS:
+            # 命中：False 表示不改写；bytes 表示改写后的完整 payload 头
+            if cached is _SKIP:
+                return None
+            return cached + payload[4:]
 
-        # 读取大端 int32 协议号
-        client_proto = struct.unpack_from(">i", payload, 0)[0]
+        # 未命中：解析协议号（大端 int32）
+        client_proto = _UNPACK_S32BE(head, 0)[0]
         label = "RequestNetworkSettings" if pid == PID_REQUEST_NETWORK_SETTINGS else "Login"
+
+        # 判定：协议号合法、与目标有差异、且差值在允许范围内才改写
+        if (client_proto == self._server_protocol or client_proto <= 0
+                or client_proto > 100000
+                or abs(client_proto - self._server_protocol) > self._max_protocol_diff):
+            decision = _SKIP
+        else:
+            decision = self._target_bytes
+
+        # LRU 缓存决策（用 4 字节头做 key，天然区分不同协议号）
+        if len(cache) >= self._cache_max:
+            cache.popitem(last=False)
+        cache[head] = decision
+
+        if decision is _SKIP:
+            return None
         if self._debug:
-            self.logger.info("%s 客户端协议号=%d 服务器=%d" % (label, client_proto, target))
-
-        if client_proto == target or client_proto <= 0 or client_proto > 100000:
-            return None
-        if abs(client_proto - target) > self._max_protocol_diff:
-            if self._debug:
-                self.logger.warning("协议号差异过大(%d)，跳过改写" % abs(client_proto - target))
-            return None
-
-        # 用大端 int32 写回服务器协议号，保留后续 payload
-        return struct.pack(">i", target) + payload[4:]
+            self.logger.info("%s 客户端协议号=%d 服务器=%d (未缓存，已记入缓存)"
+                             % (label, client_proto, self._server_protocol))
+        return decision + payload[4:]
 
     # ---------------- 进服通报 ----------------
     @event_handler
@@ -137,13 +152,12 @@ class VersionGatePlugin(Plugin):
         if not self._announce_enabled:
             return
         player = event.player
+        # 正常路径直接取值，异常才回退（v1.1：减少 try/except 覆盖的正常流程）
         try:
             name = player.name
-        except Exception:
-            name = "未知玩家"
-        try:
             version = player.game_version or self._minecraft_version
         except Exception:
+            name = "未知玩家"
             version = self._minecraft_version
 
         try:
