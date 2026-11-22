@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone-versiongate"
-version = "1.1.0"
-description = "Allow Minecraft Bedrock 1.26.x clients to join and announce each player's game version on join. v1.1 adds hot-path performance optimizations."
+version = "1.2.0"
+description = "Allow Minecraft Bedrock 1.26.x clients to join and announce each player's game version on join. v1.2 adds thread-safe cache and observability."
 
 [project.entry-points."endstone"]
 versiongate = "endstone_versiongate:VersionGatePlugin"
