@@ -1,0 +1,17 @@
+# VersionGate 配置
+
+# 是否启用版本绕行（让 1.26.x 各版本进入服务器）
+enable_version_bypass = true
+
+# 是否启用玩家进服全服通报
+enable_join_announcement = true
+
+# 进服通报消息模板，可用占位符：{name} 玩家名，{version} 游戏版本
+announcement_template = "[{name}]该玩家是[{version}]，欢迎你加入服务器！"
+
+# 允许的客户端协议号与服务器协议号的最大差值，超过则不改写（防止误伤其它版本）
+# 默认 1400 可覆盖整个 1.26.x 系列（协议号约 924~2225）
+max_protocol_diff = 1400
+
+# 是否输出详细调试日志（排查版本问题时可开启）
+debug = false
