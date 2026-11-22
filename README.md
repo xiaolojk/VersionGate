@@ -1,4 +1,4 @@
-<div align="center">
+“”<div align="center">
 
 # 🛡️ VersionGate
 
@@ -180,6 +180,6 @@ python -m build --wheel
 
 <div align="center">
 
-Made with ❤️ by 橘子 · 2026
+Made with by 橘子 · 2026
 
 </div>
