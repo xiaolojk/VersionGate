@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "endstone-protocolbridge"
+version = "2.0.0"
+description = "Bedrock 1.26.x cross-version packet translator for Endstone (真正的跨版本包翻译)"
+requires-python = ">=3.12"
+dependencies = ["bedrock-protocol>=0.5.1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["endstone_protocolbridge"]
+
+[project.entry-points.endstone]
+protocolbridge = "endstone_protocolbridge:ProtocolBridgePlugin"
