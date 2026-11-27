@@ -1,9 +1,12 @@
-# ProtocolBridge — 真正的跨版本包翻译器（Proof of Concept + 可用核心）
+# ProtocolBridge v2.0 — 跨版本完整版插件（握手准入 + 包翻译，单插件无需配套）
 
 ## 这是什么
 
-VersionGate 只改登录包的 4 字节协议号，能骗过版本校验让客户端"进服"，但游戏包结构对不上会导致功能异常。
-**ProtocolBridge 解决的是真正的难题：把旧版客户端的游戏包按字段翻译给新版服务器，反向也翻译。**
+旧版 VersionGate 只改登录包的 4 字节协议号，能骗过版本校验让客户端"进服"，但游戏包结构对不上会导致功能异常。
+**v2.0 是一个完整版插件：先把旧版的握手准入能力原样内置（改协议号 + 进服通报），再新增真正的数据包字段翻译——
+把旧版客户端的游戏包按字段翻译给新版服务器，反向也翻译。一个 `.whl` 全搞定，无需 v1.x 配套，也不要同时装 v1.3。**
+
+配置文件 `config.toml` 的三个开关默认全开：`enable_version_bypass`（握手准入）、`enable_join_announcement`（进服通报）、`enable_translation`（包翻译）。
 
 核心基于 Endstone 官方维护的 [`bedrock-protocol`](https://github.com/EndstoneMC/bedrock-protocol) 库（v0.5.1），
 它提供按协议版本的 `decode`/`encode`，覆盖 649~2259 全部协议（含服务器的 2225 和 2193 等 1.26.x 全部档位）。
@@ -59,8 +62,9 @@ VersionGate 只改登录包的 4 字节协议号，能骗过版本校验让客�
 ## 文件
 
 - `protocol_bridge.py` — 翻译核心（纯 Python，可独立测试）
-- `bridge_plugin.py` — Endstone 插件层（双向包事件 + 自适应明文检测 + 客户端版本追踪）
-- `test_protocol_bridge.py` — 测试
+- `bridge_plugin.py` — Endstone 插件层（**握手协议号改写 + 进服通报 + 双向包翻译** + 自适应明文检测 + 客户端版本追踪，完整版无需 v1.x）
+- `config.toml` — 完整配置（三个功能开关默认全开）
+- `test_protocol_bridge.py` — 翻译核心测试
 - `.venv/` — Python 3.12 + bedrock-protocol 0.5.1（沙箱）
 
 ## 部署前提与风险（重要）
@@ -68,9 +72,10 @@ VersionGate 只改登录包的 4 字节协议号，能骗过版本校验让客�
 1. **Python 版本冲突**：`bedrock-protocol` 需要 Python ≥3.12，而生产服务器 Endstone 跑在 Python 3.11。
    实测 3.11 无法加载其 `abi3.so`（缺 `PyErr_SetRaisedException` 符号）。
    → 部署需先把服务器 Endstone 环境升级到 Python 3.12（uv 管理的解释器可装）。
+   → **注意**：即使 Python <3.12，握手协议号改写和进服通报仍正常工作，只有包翻译不启动，不会搞崩服务器。
 2. **加密层未定论**：Endstone 的 `PacketReceiveEvent.payload` 是否在解密后暴露明文，文档未明确。
    → 插件内置**自适应自检**：运行时 decode 成功=明文→激活翻译；连续失败=密文→自动进入被动模式，
-   不改写任何包、不影响服务器。因此即使环境不满足也不会搞崩服务器。
+   只跳过包翻译、协议号改写仍生效，不影响服务器。因此即使环境不满足也不会搞崩服务器。
 3. **未做真实客户端端到端**：沙箱无真实基岩客户端，未验证"旧版客户端真能正常玩"。
    → 需部署后用真实 1.26.51 客户端实测。
 
