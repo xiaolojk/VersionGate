@@ -1,21 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-VersionGate - Endstone 插件 (v1.2 健壮性 + 可观测性优化版)
+VersionGate - Endstone 插件 (v1.3 1.26.x 精确兼容版)
+====================================================
 功能：
 1. 版本准入：拦截客户端登录握手包，将客户端上报的协议号改写为服务器协议号，
-   让 Minecraft Bedrock 1.26.x 各小版本客户端都能进入服务器（类似轻量 ViaVersion）。
+   让 Minecraft Bedrock 1.26.x 各小版本客户端都能进入服务器。
 2. 进服通报：玩家进入服务器后，全服广播
    "[名称]该玩家是[游戏版本]，欢迎你加入服务器！"
 
 版本演进：
 - v1.0 初版：协议号改写 + 进服通报
-- v1.1 性能优化：预编译 struct、预计算目标字节、改写决策 LRU 缓存、
-  去除全量字节比较、热路径局部变量化
-- v1.2 健壮性/可观测性优化：
-  * 决策缓存改为并发安全（命中无锁 + miss 加锁二次确认的双检锁）
-  * 通报模板预解析为片段序列，避免每次 str.format 解析格式串
-  * 热路径去除浪费计算：label 仅 debug 时构造、abs 改区间比较、颜色前缀预取
-  * 新增运行统计（缓存命中/未命中、改写/跳过次数），禁用/调试时输出，优化效果可观测
+- v1.1 性能优化：预编译 struct、预计算目标字节、改写决策 LRU 缓存、热路径局部变量化
+- v1.2 健壮性/可观测性：双检锁缓存、通报模板预解析、可选运行统计
+- v1.3 1.26.x 精确兼容：
+  * 协议号判定从"模糊差值"改为"1.26.x 协议号精确白名单"，杜绝误伤 1.21.x 等跨代版本
+  * 内置 1.26.x 协议号 → 版本区间反查表（minecraft.wiki 权威数据）
+  * 按协议号分档统计改写/跳过次数，能看到实际进来的是哪些版本
+  * 保留 v1.2 全部并发安全与性能优化
+
+关于 1.26.x 协议号（来源 minecraft.wiki Bedrock Protocol version numbers）：
+  2225 → 26.60 / 26.61 / 26.62 / 26.63 / 26.65 / 26.66   （服务器本代）
+  2193 → 26.50 / 26.51 / 26.52
+  2169 → 26.45
+  2168 → 26.40 / 26.41 / 26.42 / 26.43 / 26.44
+  1001 → 26.30 / 26.31 / 26.32 / 26.33 / 26.34 / 26.35
+  975  → 26.20 / 26.21 / 26.22 / 26.23
+  944  → 26.10 / 26.11 / 26.12 / 26.13
+  924  → 1.26.0 / 26.1 / 26.2 / 26.3
 """
 import struct
 import threading
@@ -29,29 +40,45 @@ from endstone.plugin import Plugin
 PID_LOGIN = 0x01                     # Login 包
 PID_REQUEST_NETWORK_SETTINGS = 0xC1  # RequestNetworkSettings 包（协议协商）
 
-# 预编译：大端 int32 结构体，模块级单例，避免每次 unpack_from 重新解析格式
+# 预编译：大端 int32 结构体，模块级单例
 _S32BE = struct.Struct(">i")
 _UNPACK_S32BE = _S32BE.unpack_from
 _PACK_S32BE = _S32BE.pack
 
-# 改写决策缓存上限：协议号种类有限，128 足够覆盖所有已知客户端版本
+# 改写决策缓存上限
 _REWRITE_CACHE_MAX = 128
 
-# 缓存哨兵：区分"未缓存"(_MISS) 与"判定为不改写"(_SKIP)
+# 缓存哨兵
 _MISS = object()
 _SKIP = object()
 
 # 通报模板支持的占位符
 _TEMPLATE_FIELDS = ("name", "version")
 
+# ---------------------------------------------------------------------------
+# v1.3：1.26.x 协议号 → 版本区间反查表（minecraft.wiki 权威数据）
+# ---------------------------------------------------------------------------
+PROTOCOL_126X = {
+    2225: "26.60~26.66",
+    2193: "26.50~26.52",
+    2169: "26.45",
+    2168: "26.40~26.44",
+    1001: "26.30~26.35",
+    975:  "26.20~26.23",
+    944:  "26.10~26.13",
+    924:  "1.26.0~26.3",
+}
+# 默认白名单 = 上表全部协议号；可由 config.toml 的 allowed_protocols 覆盖
+DEFAULT_ALLOWED_PROTOCOLS = sorted(PROTOCOL_126X.keys())
+
+
+def _proto_label(proto: int) -> str:
+    """把协议号转成可读版本标签，未知返回 '协议号N'。"""
+    return PROTOCOL_126X.get(proto, "协议号%d" % proto)
+
 
 def _parse_template(template: str):
-    """把通报模板预解析为片段序列 [(kind, value), ...]。
-
-    kind=0 字面量，kind=1 字段（name/version）。
-    解析一次后，每次通报只需按顺序拼接片段，避免 str.format 反复解析格式串。
-    仅识别 {name} / {version}，其它内容按字面量保留（兼容第三方自定义文本）。
-    """
+    """把通报模板预解析为片段序列 [(kind, value), ...]。kind=0 字面量，1 字段。"""
     segments = []
     buf = []
     i = 0
@@ -93,35 +120,46 @@ class VersionGatePlugin(Plugin):
         template = str(cfg.get("announcement_template",
                        "[{name}]该玩家是[{version}]，欢迎你加入服务器！"))
         self._debug = bool(cfg.get("debug", False))
-        # 允许改写的协议号范围：客户端协议号与服务器相差不超过该值才改写，避免误伤
+
+        # v1.3：精确协议号白名单。只改写白名单内的协议号，杜绝误伤 1.21.x 等跨代版本。
+        allowed = cfg.get("allowed_protocols", DEFAULT_ALLOWED_PROTOCOLS)
+        if not isinstance(allowed, list):
+            allowed = DEFAULT_ALLOWED_PROTOCOLS
+        self._allowed = set()
+        for v in allowed:
+            try:
+                self._allowed.add(int(v))
+            except Exception:
+                pass
+        # 差值上限作为最后兜底（默认 1400 覆盖 2225-924=1301，足够容纳整个 1.26.x）
         self._max_protocol_diff = int(cfg.get("max_protocol_diff", 1400))
 
-        # ---- v1.1 性能优化：预计算热路径所需数据 ----
+        # ---- v1.1/v1.2 性能优化保留 ----
         self._target_bytes = _PACK_S32BE(self._server_protocol)
         self._rewrite_cache = OrderedDict()
         self._cache_max = _REWRITE_CACHE_MAX
-        # ---- v1.2 健壮性：决策缓存写操作互斥锁（命中路径无锁）----
         self._cache_lock = threading.Lock()
-
-        # ---- v1.2 可观测性：运行统计（默认关闭，零默认开销）----
-        # 统计项：[0]命中 [1]未命中 [2]改写 [3]跳过
         self._enable_stats = bool(cfg.get("enable_stats", False))
+        # 统计：[0]命中 [1]未命中 [2]改写 [3]跳过
         self._stats = [0, 0, 0, 0]
+        # v1.3：按协议号分档统计 {proto: [改写数, 跳过数]}
+        self._proto_stats = {}
+        self._stats_lock = threading.Lock()
 
-        # ---- v1.2 通报优化：预解析模板 + 预取颜色前缀 ----
         self._template_segments = _parse_template(template)
         self._msg_prefix = ColorFormat.YELLOW
         self._msg_suffix = ColorFormat.RESET
 
         self.register_events(self)
+        whitelist = ", ".join(str(p) for p in sorted(self._allowed))
         self.logger.info(
-            "VersionGate v1.2 已启用 | 服务器协议号=%d | MC版本=%s | 版本绕行=%s | 进服通报=%s | 决策缓存=%d"
+            "VersionGate v1.3 已启用 | 服务器协议号=%d | MC版本=%s | 版本绕行=%s | 进服通报=%s | "
+            "1.26.x白名单=[%s] | 决策缓存=%d"
             % (self._server_protocol, self._minecraft_version,
-               self._bypass_enabled, self._announce_enabled, self._cache_max)
+               self._bypass_enabled, self._announce_enabled, whitelist, self._cache_max)
         )
 
     def on_disable(self) -> None:
-        # v1.2：若开启统计，输出本次运行的汇总，让优化效果可观测
         if self._enable_stats:
             hit, miss, rewrite, skip = self._stats
             total = hit + miss
@@ -130,19 +168,23 @@ class VersionGatePlugin(Plugin):
                 "VersionGate 运行统计 | 缓存命中=%d/%d (%.1f%%) | 改写=%d | 跳过=%d"
                 % (hit, total, rate, rewrite, skip)
             )
+            if self._proto_stats:
+                lines = []
+                for proto in sorted(self._proto_stats, reverse=True):
+                    rw, sk = self._proto_stats[proto]
+                    lines.append("%s(%d):改写%d/跳过%d" % (_proto_label(proto), proto, rw, sk))
+                self.logger.info("VersionGate 分档统计 | " + " | ".join(lines))
         self.logger.info("VersionGate 已禁用")
 
     # ---------------- 版本准入：改写登录包协议号 ----------------
     @event_handler
     def on_packet_receive(self, event: PacketReceiveEvent) -> None:
-        # 热路径：局部变量化，减少重复 self 属性访问
         if not self._bypass_enabled:
             return
         pid = event.packet_id
         if pid != PID_LOGIN and pid != PID_REQUEST_NETWORK_SETTINGS:
             return
         payload = event.payload
-        # 协议号占 4 字节；不足则跳过
         if payload is None or len(payload) < 4:
             return
 
@@ -158,22 +200,14 @@ class VersionGatePlugin(Plugin):
                 self.logger.warning("协议号改写跳过(包ID=%d): %s" % (pid, e))
 
     def _rewrite(self, payload: bytes, pid: int = PID_LOGIN):
-        """把 payload 开头的协议号改写为服务器协议号。返回新字节或 None。
-
-        RequestNetworkSettings 与 Login 包的 ClientProtocol 均为大端 int32（4 字节）。
-
-        v1.2：双检锁并发安全缓存——命中路径无锁读取；未命中才加锁，
-        在锁内二次确认后解析并写入决策，避免多玩家同时进服时的 LRU 竞态。
-        """
+        """把 payload 开头的协议号改写为服务器协议号。返回新字节或 None。"""
         head = payload[:4]
         cache = self._rewrite_cache
         stats = self._stats
         enable = self._enable_stats
 
-        # 第一重检查（无锁）：绝大多数包在此命中，直接拼接返回
         cached = cache.get(head, _MISS)
         if cached is _MISS:
-            # 未命中：加锁做第二重检查 + 解析 + 写入
             cached = self._decide(head, pid, stats, enable)
         elif enable:
             stats[0] += 1  # 命中
@@ -187,40 +221,50 @@ class VersionGatePlugin(Plugin):
         return cached + payload[4:]
 
     def _decide(self, head: bytes, pid: int, stats, enable: bool):
-        """（线程安全）解析协议号、判定是否改写，并写入决策缓存。"""
+        """（线程安全）解析协议号、按 1.26.x 白名单判定，并写入决策缓存。"""
         cache = self._rewrite_cache
         with self._cache_lock:
-            # 第二重检查：可能上一个线程已写入同样的决策
             cached = cache.get(head, _MISS)
             if cached is not _MISS:
                 if enable:
-                    stats[0] += 1  # 命中（并发下另一线程刚写入）
+                    stats[0] += 1
                 return cached
 
             if enable:
                 stats[1] += 1  # 未命中
             client_proto = _UNPACK_S32BE(head, 0)[0]
 
-            # 判定：协议号合法、与目标有差异、且差值在允许范围内才改写。
-            # v1.2：用区间比较替代 abs() 函数调用。
+            # v1.3 精确判定：
+            # 1) 协议号合法  2) 必须在 1.26.x 白名单内  3) 与服务器有差异  4) 差值在兜底上限内
+            in_whitelist = client_proto in self._allowed
             diff = client_proto - self._server_protocol
-            if (client_proto == self._server_protocol or client_proto <= 0
-                    or client_proto > 100000
+            if (client_proto <= 0 or client_proto > 100000
+                    or not in_whitelist
+                    or client_proto == self._server_protocol
                     or diff > self._max_protocol_diff or diff < -self._max_protocol_diff):
                 decision = _SKIP
             else:
                 decision = self._target_bytes
 
-            # LRU 缓存决策（写操作在锁内，保证原子）
+            # v1.3：分档统计（独立加锁）
+            if enable:
+                with self._stats_lock:
+                    rec = self._proto_stats.setdefault(client_proto, [0, 0])
+                    rec[0 if decision is not _SKIP else 1] += 1
+
+            # LRU 缓存决策
             if len(cache) >= self._cache_max:
                 cache.popitem(last=False)
             cache[head] = decision
 
             if self._debug:
-                # v1.2：label 仅在 debug 时构造，热路径不再浪费
                 label = "RequestNetworkSettings" if pid == PID_REQUEST_NETWORK_SETTINGS else "Login"
-                self.logger.info("%s 客户端协议号=%d 服务器=%d (未缓存，已记入缓存)"
-                                 % (label, client_proto, self._server_protocol))
+                verdict = "改写" if decision is not _SKIP else "跳过"
+                self.logger.info(
+                    "%s 客户端协议号=%d(%s) 服务器=%d → %s"
+                    % (label, client_proto, _proto_label(client_proto),
+                       self._server_protocol, verdict)
+                )
             return decision
 
     # ---------------- 进服通报 ----------------
@@ -229,7 +273,6 @@ class VersionGatePlugin(Plugin):
         if not self._announce_enabled:
             return
         player = event.player
-        # 正常路径直接取值，异常才回退（减少 try/except 覆盖的正常流程）
         try:
             name = player.name
             version = player.game_version or self._minecraft_version
@@ -237,7 +280,6 @@ class VersionGatePlugin(Plugin):
             name = "未知玩家"
             version = self._minecraft_version
 
-        # v1.2：用预解析片段拼接通报消息，避免 str.format 每次解析格式串
         parts = []
         for kind, value in self._template_segments:
             parts.append(value if kind == 0 else (name if value == "name" else version))
