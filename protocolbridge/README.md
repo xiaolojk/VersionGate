@@ -21,7 +21,7 @@ Endstone 基岩版插件：协议号改写 + 进服通报 + 深度包翻译 + �
 
 ## 配置（物品映射）
 
-面板「插件配置 → 物品 ID 映射」可视化增删，或编辑 `config.toml`：
+编辑 `config.toml`：
 
 ```
 enable_item_remap = true

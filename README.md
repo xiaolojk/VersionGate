@@ -56,7 +56,7 @@ Endstone 基岩版跨版本插件：让 **1.21.x 老客户端** 和 **1.26.x 新
 
 物品映射（可选）：`config.toml` 的 `[item_id_map]` 段，左边填 1.26 新物品 ID 或方块 `block_runtime_id`，右边填 1.21 确实存在的物品 ID。左边没有配到的方块物品会用 `fallback_item_id` 兜底。改完重启服务器生效。
 
-映射表只需编辑 config.toml，不依赖任何外部管理面板。
+映射表只需编辑 config.toml。
 
 ## 常见问题
 
