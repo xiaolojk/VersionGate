@@ -119,13 +119,17 @@ class ProtocolBridgeCore:
 
     def __init__(self, server_protocol: int = 2225, strict: bool = False,
                  blocked_ids: Optional[set] = None,
-                 only_ids: Optional[set] = None):
+                 only_ids: Optional[set] = None,
+                 only_ids_by_proto: Optional[Dict[int, set]] = None):
         self.server_protocol = int(server_protocol)
         self.strict = bool(strict)  # True=翻译失败时返回 None 阻断；False=放行原包
         self.blocked_ids = set(blocked_ids or ())
-        # only_ids：只对这些包做翻译，其余直接放行（性能优化）。
-        # None 表示翻译所有包。传入 2193→2225 探测得到的 8 个包即可覆盖实际需求。
+        # only_ids：全局翻译白名单（旧版行为/兜底）。None 表示翻译所有包。
         self.only_ids = set(only_ids) if only_ids is not None else None
+        # only_ids_by_proto：按客户端档位分列的精确白名单 {client_protocol: set(pid)}
+        # 不同档位到 2225 的差异包集合完全不同（924 有 40 个，2193 只有 7 个），
+        # 必须分档才能既覆盖老版本又保持零开销。优先级高于 only_ids。
+        self.only_ids_by_proto = dict(only_ids_by_proto) if only_ids_by_proto else None
         self.stats = TranslateStats()
         # 缓存：某 (client_proto, pid) 是否字节兼容（由探测得出）
         self._compat_cache: Dict[Tuple[int, int], bool] = {}
@@ -133,22 +137,68 @@ class ProtocolBridgeCore:
     @staticmethod
     def known_translate_ids() -> set:
         """
-        2193(1.26.51) → 2225(1.26.65) 实测需要翻译的 8 个包 ID。
-        其余 223 个共有包字节兼容，无需翻译。
-        来源：全量字段差异 + 跨版本 decode 探测。
+        2193(1.26.51) → 2225(1.26.65) 实测需要翻译的 8 个包 ID（默认兜底值）。
+        其余 223 个共有包字节兼容。来源：全量字段差异 + 跨版本 decode 探测。
+        新代码应优先用 probe_required_ids() 按档位生成精确表。
         """
         return {11, 12, 13, 44, 58, 77, 93, 348}
+
+    @staticmethod
+    def probe_required_ids(client_protocol: int, server_protocol: int) -> Optional[set]:
+        """
+        探测某客户端档位到服务器档位【真正需要翻译】的包 ID 集合。
+
+        判定规则（对每个两版本共有的 packet_id）：
+          1) 用源版本 encode 一个默认对象；若失败（如 CommandRequest 需必填字段），
+             说明该包结构特殊，保守纳入翻译集合；
+          2) 用目标版本 decode 这份字节；若失败，说明结构不兼容，纳入翻译集合；
+          3) 两者都成功 → 字节级兼容，无需翻译。
+
+        返回 None 表示该客户端档位不被官方库支持（如 2169），此时调用方应
+        降级为「只改协议号、不翻译」而非报错。
+
+        探测结果建议在插件 on_enable 时对每个允许档位各跑一次并缓存，
+        运行期零开销。
+        """
+        src_mod = _module(client_protocol)
+        dst_mod = _module(server_protocol)
+        if src_mod is None or dst_mod is None:
+            return None
+        required = set()
+        for pid in range(1, 400):
+            src_cls = _packet_class(client_protocol, pid)
+            dst_cls = _packet_class(server_protocol, pid)
+            if src_cls is None or dst_cls is None:
+                continue
+            try:
+                data = src_mod.encode(src_cls())
+            except Exception:
+                # 默认实例无法编码（必填字段/特殊结构）→ 保守纳入
+                required.add(pid)
+                continue
+            try:
+                dst_mod.decode(dst_cls, data)
+            except Exception:
+                required.add(pid)
+        return required
 
     def client_module(self, proto: int):
         return _module(proto)
 
-    def _translate(self, pid: int, payload: bytes, src_proto: int, dst_proto: int) -> Optional[bytes]:
+    def _translate(self, pid: int, payload: bytes, src_proto: int, dst_proto: int,
+                   client_proto: Optional[int] = None) -> Optional[bytes]:
         """通用字段级翻译：src_proto 编码的 payload -> dst_proto 编码。"""
         if src_proto == dst_proto:
             return None  # 同版本无需翻译
         if pid in self.blocked_ids:
             return None
-        if self.only_ids is not None and pid not in self.only_ids:
+        # 按客户端档位选白名单：优先用分档精确表，未命中则用全局 only_ids
+        ids = None
+        if self.only_ids_by_proto is not None and client_proto is not None:
+            ids = self.only_ids_by_proto.get(client_proto)
+        if ids is None:
+            ids = self.only_ids
+        if ids is not None and pid not in ids:
             return None  # 不在翻译白名单，直接放行（零开销）
         src_cls = _packet_class(src_proto, pid)
         dst_cls = _packet_class(dst_proto, pid)
@@ -189,7 +239,7 @@ class ProtocolBridgeCore:
     def translate_receive(self, pid: int, payload: bytes, client_protocol: int) -> Optional[bytes]:
         """客户端(旧版)->服务器(新版)。返回新 payload 或 None(保持原样)。"""
         self.stats.received += 1
-        out = self._translate(pid, payload, client_protocol, self.server_protocol)
+        out = self._translate(pid, payload, client_protocol, self.server_protocol, client_protocol)
         if out is not None:
             self.stats.translated_rx += 1
         elif self.strict and client_protocol != self.server_protocol:
@@ -200,7 +250,7 @@ class ProtocolBridgeCore:
     def translate_send(self, pid: int, payload: bytes, client_protocol: int) -> Optional[bytes]:
         """服务器(新版)->客户端(旧版)。返回新 payload 或 None(保持原样)。"""
         self.stats.sent += 1
-        out = self._translate(pid, payload, self.server_protocol, client_protocol)
+        out = self._translate(pid, payload, self.server_protocol, client_protocol, client_protocol)
         if out is not None:
             self.stats.translated_tx += 1
         return out
