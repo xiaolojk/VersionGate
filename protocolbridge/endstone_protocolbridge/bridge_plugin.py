@@ -26,15 +26,37 @@ ProtocolBridge Plugin v2.0 — Endstone 基岩版 1.26.x 跨版本完整兼容�
 import struct
 import threading
 from collections import OrderedDict
+from pathlib import Path
 
 from endstone import ColorFormat
 from endstone.event import event_handler, PacketReceiveEvent, PacketSendEvent, PlayerJoinEvent
 from endstone.plugin import Plugin
 
 try:
-    from .protocol_bridge import ProtocolBridgeCore, SUPPORTED_PROTOCOLS
+    from .protocol_bridge import ProtocolBridgeCore, SUPPORTED_PROTOCOLS, _packet_class, _module
+    from .version_gate import VersionGateConfig, FOLDER_NAME
+    from .deep_translator import DeepTranslator
+    from .connection_state import ConnectionStateRegistry, CONTEXT_FIELDS
 except ImportError:  # 兼容直接运行/测试
-    from protocol_bridge import ProtocolBridgeCore, SUPPORTED_PROTOCOLS
+    from protocol_bridge import ProtocolBridgeCore, SUPPORTED_PROTOCOLS, _packet_class, _module
+    from version_gate import VersionGateConfig, FOLDER_NAME
+    from deep_translator import DeepTranslator
+    from connection_state import ConnectionStateRegistry, CONTEXT_FIELDS
+
+# 1.21.x 与 1.26.x 的分界：924 是 1.26.0，以下都是 1.21.x
+# 走深度翻译的最大客户端协议号（含）。924=1.26.0 与 2225 的方块描述符/物品
+# 嵌套结构差异大，浅字段复制会把 BlockPos.y 算错、物品描述符整体赋值失败；
+# 实测深度翻译能正确重建，故把 924 纳入深度路径。944+ 仍走小差异翻译。
+DEEP_TRANSLATE_MAX_PROTO = 924
+
+
+def _module_ok(proto: int) -> bool:
+    """官方库是否支持该协议号（有无对应解码模块）。"""
+    try:
+        from protocol_bridge import _module as _m
+    except ImportError:
+        from .protocol_bridge import _module as _m
+    return _m(proto) is not None
 
 # 基岩版数据包 ID（不含包头）
 PID_LOGIN = 0x01                     # Login 包
@@ -51,8 +73,10 @@ _MISS = object()
 _SKIP = object()
 _TEMPLATE_FIELDS = ("name", "version")
 
-# 1.26.x 协议号 → 版本区间（minecraft.wiki 权威数据）
-PROTOCOL_126X = {
+# 协议号 → 版本区间（minecraft.wiki 权威数据）
+# 覆盖 1.21.x 全系 + 1.26.x 全系，供白名单改写与进服通报识别
+PROTOCOL_VERSIONS = {
+    # ---- 1.26.x ----
     2225: "26.60~26.66",
     2193: "26.50~26.52",
     2169: "26.45",
@@ -61,13 +85,38 @@ PROTOCOL_126X = {
     975:  "26.20~26.23",
     944:  "26.10~26.13",
     924:  "1.26.0~26.3",
+    # ---- 1.21.x ----
+    898:  "1.21.130~1.21.132",
+    860:  "1.21.124",
+    859:  "1.21.120~1.21.123",
+    844:  "1.21.111~1.21.114",
+    827:  "1.21.100~1.21.101",
+    819:  "1.21.92~1.21.94",
+    818:  "1.21.90~1.21.91",
+    800:  "1.21.80~1.21.84",
+    786:  "1.21.70~1.21.73",
+    776:  "1.21.60~1.21.62",
+    766:  "1.21.50~1.21.51",
+    748:  "1.21.40~1.21.44",
+    729:  "1.21.30~1.21.31",
+    712:  "1.21.20~1.21.23",
+    686:  "1.21.2~1.21.3",
+    685:  "1.21.0~1.21.1",
 }
-DEFAULT_ALLOWED_PROTOCOLS = sorted(PROTOCOL_126X.keys())
+# 兼容旧变量名（外部若有引用）
+PROTOCOL_126X = PROTOCOL_VERSIONS
+
+# 默认白名单：1.21.x 全系 + 1.26.x 全系
+DEFAULT_ALLOWED_PROTOCOLS = sorted(PROTOCOL_VERSIONS.keys())
+
+# 1.21.x 协议号集合（用于分类判定）
+PROTOCOL_121X = {685, 686, 712, 729, 748, 766, 776, 786, 800,
+                 818, 819, 827, 844, 859, 860, 898}
 
 
 def _proto_label(proto: int) -> str:
     """把协议号转成可读版本标签，未知返回 '协议号N'。"""
-    return PROTOCOL_126X.get(proto, "协议号%d" % proto)
+    return PROTOCOL_VERSIONS.get(proto, "协议号%d" % proto)
 
 
 def _parse_template(template: str):
@@ -126,7 +175,8 @@ class ProtocolBridgePlugin(Plugin):
                 self._allowed.add(int(v))
             except Exception:
                 pass
-        self._max_protocol_diff = int(cfg.get("max_protocol_diff", 1400))
+        # 默认 1540 覆盖 1.21.0(685)~1.26.65(2225) 全跨度；主判定以白名单为准
+        self._max_protocol_diff = int(cfg.get("max_protocol_diff", 1540))
 
         self._target_bytes = _PACK_S32BE(self._server_protocol)
         self._rewrite_cache = OrderedDict()
@@ -134,6 +184,46 @@ class ProtocolBridgePlugin(Plugin):
         self._rw_stats = [0, 0, 0, 0]  # 命中/未命中/改写/跳过
         self._proto_stats = {}
         self._stats_lock = threading.Lock()
+
+        # ---------- 功能 3b：物品 ID 映射（1.26新id/方块bri → 1.21已有id，防空气）----------
+        self._item_id_map = {}
+        self._enable_item_remap = bool(cfg.get("enable_item_remap", True))
+        self._fallback_item_id = int(cfg.get("fallback_item_id", 1) or 0)
+        raw_id_map = cfg.get("item_id_map", None)
+        if isinstance(raw_id_map, dict):
+            for k, v in raw_id_map.items():
+                try:
+                    ki, vi = int(k), int(v)
+                    if ki > 0 and vi > 0:
+                        self._item_id_map[ki] = vi
+                except Exception:
+                    continue
+
+        # ---------- 功能 3：VersionGate 物品名替换（1.26新物品→1.21替代）----------
+        self._vg_config = None
+        self._item_map = {}
+        self._item_replace_enabled = False
+        try:
+            data_folder = getattr(self, "data_folder", None)
+            if data_folder is None:
+                raise RuntimeError("无 data_folder（测试环境）")
+            self._vg_config = VersionGateConfig(str(data_folder))
+            created = self._vg_config.ensure_config()
+            item_map, vg_settings = self._vg_config.load()
+            self._item_map = item_map
+            self._item_replace_enabled = bool(
+                vg_settings.get("enable_item_replacement", True)
+            ) and bool(item_map)
+            if created:
+                self.logger.info(
+                    "VersionGate 已生成配置文件夹: %s（物品映射请在此文件编辑，重启生效）"
+                    % str(Path(data_folder) / FOLDER_NAME)
+                )
+            if self._item_replace_enabled:
+                self.logger.info("VersionGate 已加载 %d 条物品映射" % len(item_map))
+        except Exception as e:
+            # 测试环境/无数据目录时静默降级，不影响核心功能
+            self.logger.info("VersionGate 未启用（%s）" % e)
 
         # ---------- 功能 2：游戏包翻译 ----------
         self._translation_enabled = bool(cfg.get("enable_translation", True))
@@ -167,11 +257,34 @@ class ProtocolBridgePlugin(Plugin):
             only_ids=(manual_ids if manual_ids is not None
                       else ProtocolBridgeCore.known_translate_ids()),  # 兜底
             only_ids_by_proto=by_proto if by_proto else None,
+            item_map=self._item_map,
+            item_replace_enabled=self._item_replace_enabled,
         )
+
+        # 1.21.x 深度翻译器（跨大版本）：每个档位一个实例，启动时建好，运行期零开销
+        self._deep_enabled = bool(cfg.get("enable_deep_translation", True))
+        self._deep: dict = {}
+        if self._deep_enabled and self._translation_enabled:
+            for proto in sorted(self._allowed):
+                if proto <= DEEP_TRANSLATE_MAX_PROTO and proto != self._server_protocol:
+                    try:
+                        if _module_ok(proto):
+                            self._deep[proto] = DeepTranslator(
+                                self._server_protocol, proto,
+                                item_id_map=self._item_id_map,
+                                fallback_item_id=self._fallback_item_id,
+                                enable_item_remap=self._enable_item_remap,
+                            )
+                    except Exception as e:
+                        self.logger.warning("深度翻译器初始化失败 协议%d: %s" % (proto, e))
 
         # 每个地址/subclient 对应的客户端真实协议号（从登录包记录，供翻译用）
         self._client_proto: dict = {}
         self._proto_lock = threading.Lock()
+
+        # 连接级状态（借鉴 ViaVersion Storable）：追踪每个玩家的 StartGame registry 上下文
+        self._connections = ConnectionStateRegistry()
+        self._track_context = bool(cfg.get("enable_connection_context", True))
 
         # 自适应模式：None=未检测，True=明文可翻译，False=被动（仍改协议号但跳过翻译）
         self._plaintext_confirmed = None
@@ -179,13 +292,16 @@ class ProtocolBridgePlugin(Plugin):
 
         self.register_events(self)
         whitelist = ", ".join(str(p) for p in sorted(self._allowed))
+        vg_state = "启用(%d条)" % len(self._item_map) if self._item_replace_enabled else "关闭"
+        remap_state = ("启用(%d条映射,兜底id=%d)" % (len(self._item_id_map), self._fallback_item_id)) \
+            if self._enable_item_remap else "关闭"
         self.logger.info(
-            "ProtocolBridge v2.0.1 已启用（完整版：握手准入+包翻译，无需 v1.x）| "
+            "ProtocolBridge v3.0.0 已启用（握手准入+深度包翻译+VersionGate物品替换+防空气，无需 v1.x）| "
             "服务器协议=%d | MC版本=%s | 协议号改写=%s | 进服通报=%s | 包翻译=%s | "
-            "1.26.x白名单=[%s]"
+            "物品名替换=%s | 物品ID映射/防空气=%s | 白名单(1.21.x+1.26.x)=[%s]"
             % (self._server_protocol, self._minecraft_version,
                self._bypass_enabled, self._announce_enabled, self._translation_enabled,
-               whitelist)
+               vg_state, remap_state, whitelist)
         )
         if self._translation_enabled and self._probe_count_by_proto:
             detail = " | ".join(
@@ -324,6 +440,30 @@ class ProtocolBridgePlugin(Plugin):
         with self._proto_lock:
             return self._client_proto.get(self._addr_key(event), self._server_protocol)
 
+    # ================= 连接级状态（ViaVersion Storable 等价物） =================
+    def _capture_start_game(self, event, client_proto: int) -> None:
+        """从服务端 StartGame 包捕获 registry 上下文，写入该玩家的连接状态。"""
+        try:
+            st = self._connections.get(event.address, getattr(event, "sub_client_id", 0),
+                                       client_protocol=client_proto, create=True)
+            cls = _packet_class(self._server_protocol, 11)
+            if cls is None:
+                return
+            obj = _module(self._server_protocol).decode(cls, bytes(event.payload))
+            fields = {}
+            for k in CONTEXT_FIELDS:
+                try:
+                    v = getattr(obj, k)
+                    fields[k] = getattr(v, "value", v) if hasattr(v, "value") else v
+                except Exception:
+                    pass
+            st.on_start_game(fields)
+            if self._debug:
+                self.logger.info("连接状态已捕获 StartGame 上下文: %s" % st.summary())
+        except Exception as e:
+            if self._debug:
+                self.logger.warning("捕获 StartGame 上下文跳过: %s" % e)
+
     # ================= 自适应明文检测 =================
     def _try_plaintext_probe(self, pid: int, payload: bytes) -> None:
         if self._plaintext_confirmed is not None:
@@ -380,6 +520,27 @@ class ProtocolBridgePlugin(Plugin):
         client_proto = self._client_proto_for(event)
         if client_proto == self._server_protocol:
             return
+        # 1.21.x 走跨大版本深度翻译器
+        deep = self._deep.get(client_proto) if self._deep_enabled else None
+        if deep is not None and client_proto <= DEEP_TRANSLATE_MAX_PROTO:
+            try:
+                action, out = deep.translate_recv(pid, payload)
+                if action == "drop":
+                    # 客户端独有包（老客户端发、服务端不认识）→ 取消事件
+                    try:
+                        event.cancel()
+                    except Exception:
+                        pass
+                    return
+                if out is not None:
+                    event.payload = out
+                    if self._debug:
+                        self.logger.info("深度翻译收包 pid=%d %d->%d" % (pid, client_proto, self._server_protocol))
+                    return
+                # action=fail：降级走原核心兜底
+            except Exception as e:
+                if self._debug:
+                    self.logger.warning("深度翻译收包跳过 pid=%d: %s" % (pid, e))
         try:
             out = self._core.translate_receive(pid, payload, client_proto)
             if out is not None:
@@ -402,6 +563,31 @@ class ProtocolBridgePlugin(Plugin):
         payload = event.payload
         if not payload:
             return
+        # ---- 连接级状态：捕获 StartGame(pid=11) 下发的 registry 上下文 ----
+        # 借鉴 ViaVersion：后续 UpdateBlock/InventorySlot 的 runtime id 依赖它换算
+        if self._track_context and pid == 11 and client_proto <= DEEP_TRANSLATE_MAX_PROTO:
+            self._capture_start_game(event, client_proto)
+        # 1.21.x 走跨大版本深度翻译器
+        deep = self._deep.get(client_proto) if self._deep_enabled else None
+        if deep is not None and client_proto <= DEEP_TRANSLATE_MAX_PROTO:
+            try:
+                action, out = deep.translate_send(pid, payload)
+                if action == "drop":
+                    # 服务端独有包（1.26新功能包，老客户端不认识）→ 取消发送
+                    try:
+                        event.cancel()
+                    except Exception:
+                        pass
+                    return
+                if out is not None:
+                    event.payload = out
+                    if self._debug:
+                        self.logger.info("深度翻译发包 pid=%d %d->%d" % (pid, self._server_protocol, client_proto))
+                    return
+                # action=fail：降级走原核心兜底
+            except Exception as e:
+                if self._debug:
+                    self.logger.warning("深度翻译发包跳过 pid=%d: %s" % (pid, e))
         try:
             out = self._core.translate_send(pid, payload, client_proto)
             if out is not None:

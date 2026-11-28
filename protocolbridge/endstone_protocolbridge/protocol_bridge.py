@@ -117,10 +117,19 @@ class ProtocolBridgeCore:
       event.payload = old_payload
     """
 
+    # 物品注册表包 ID：新版(776+)=ItemRegistryPacket，早期(712~766)=ItemComponentPacket
+    PID_ITEM_REGISTRY = 162
+    # 早期 1.21 物品名表在 StartGame.items 里（712~766）
+    PID_START_GAME = 11
+    # 1.21.60+ 使用 ItemRegistryPacket(162)；更老的用 StartGame.items
+    ITEM_REGISTRY_MIN_PROTO = 776
+
     def __init__(self, server_protocol: int = 2225, strict: bool = False,
                  blocked_ids: Optional[set] = None,
                  only_ids: Optional[set] = None,
-                 only_ids_by_proto: Optional[Dict[int, set]] = None):
+                 only_ids_by_proto: Optional[Dict[int, set]] = None,
+                 item_map: Optional[Dict[str, str]] = None,
+                 item_replace_enabled: bool = False):
         self.server_protocol = int(server_protocol)
         self.strict = bool(strict)  # True=翻译失败时返回 None 阻断；False=放行原包
         self.blocked_ids = set(blocked_ids or ())
@@ -130,9 +139,69 @@ class ProtocolBridgeCore:
         # 不同档位到 2225 的差异包集合完全不同（924 有 40 个，2193 只有 7 个），
         # 必须分档才能既覆盖老版本又保持零开销。优先级高于 only_ids。
         self.only_ids_by_proto = dict(only_ids_by_proto) if only_ids_by_proto else None
+        # VersionGate 物品名替换：{1.26物品名: 1.21物品名}
+        self.item_map = dict(item_map or ())
+        self.item_replace_enabled = bool(item_replace_enabled) and bool(self.item_map)
+        self.item_replaced_count = 0  # 累计替换次数
         self.stats = TranslateStats()
         # 缓存：某 (client_proto, pid) 是否字节兼容（由探测得出）
         self._compat_cache: Dict[Tuple[int, int], bool] = {}
+
+    def set_item_map(self, item_map: Optional[Dict[str, str]], enabled: bool = True) -> None:
+        """运行期更新物品映射（供配置热加载/管理命令调用）。"""
+        self.item_map = dict(item_map or ())
+        self.item_replace_enabled = bool(enabled) and bool(self.item_map)
+
+    @classmethod
+    def needs_item_replacement(cls, pid: int, client_protocol: int) -> bool:
+        """判断某发包是否可能需要物品替换。"""
+        if client_protocol >= cls.ITEM_REGISTRY_MIN_PROTO:
+            return pid == cls.PID_ITEM_REGISTRY
+        # 早期 1.21：物品名表在 StartGame.items
+        return pid in (cls.PID_ITEM_REGISTRY, cls.PID_START_GAME)
+
+    def _replace_items_in_payload(self, pid: int, payload: bytes,
+                                  client_protocol: int) -> Optional[bytes]:
+        """
+        对服务器→客户端发包做物品名替换。
+        用服务器协议(2225)解码（物品注册表字节兼容），替换 name 后再编码回去。
+        返回新 payload 或 None（无需/无法替换，原样放行）。
+        """
+        if not self.item_replace_enabled:
+            return None
+        # 延迟导入避免循环依赖；相对导入优先（包环境），绝对导入兜底（直接运行/测试）
+        try:
+            from .version_gate import rebuild_items_with_map
+        except ImportError:
+            from version_gate import rebuild_items_with_map
+        srv_cls = _packet_class(self.server_protocol, pid)
+        srv_mod = _module(self.server_protocol)
+        if srv_cls is None or srv_mod is None:
+            return None
+        try:
+            obj = srv_mod.decode(srv_cls, bytes(payload))
+        except Exception:
+            return None
+        # 定位物品表字段（nanobind 对象必须整体重新赋值，不能改临时副本）
+        if pid == self.PID_ITEM_REGISTRY:
+            field = "items"
+        elif pid == self.PID_START_GAME and client_protocol < self.ITEM_REGISTRY_MIN_PROTO:
+            field = "items"
+        else:
+            return None
+        items = getattr(obj, field, None)
+        if not isinstance(items, list):
+            return None
+        new_items, changed = rebuild_items_with_map(items, self.item_map)
+        if changed == 0:
+            return None
+        try:
+            setattr(obj, field, new_items)  # 整体赋值，真正生效
+            out = srv_mod.encode(obj)
+        except Exception:
+            return None
+        self.item_replaced_count += changed
+        return bytes(out)
 
     @staticmethod
     def known_translate_ids() -> set:
@@ -250,6 +319,15 @@ class ProtocolBridgeCore:
     def translate_send(self, pid: int, payload: bytes, client_protocol: int) -> Optional[bytes]:
         """服务器(新版)->客户端(旧版)。返回新 payload 或 None(保持原样)。"""
         self.stats.sent += 1
+        # VersionGate：物品注册表包先做物品名替换（独立于字段翻译白名单）
+        if (self.item_replace_enabled
+                and client_protocol != self.server_protocol
+                and self.needs_item_replacement(pid, client_protocol)):
+            replaced = self._replace_items_in_payload(pid, payload, client_protocol)
+            if replaced is not None:
+                self.stats.translated_tx += 1
+                return replaced
+            # 物品替换未改动时继续走正常翻译流程（早期1.21的StartGame仍需字段翻译）
         out = self._translate(pid, payload, self.server_protocol, client_protocol, client_protocol)
         if out is not None:
             self.stats.translated_tx += 1
