@@ -139,13 +139,34 @@ class ProtocolBridgePlugin(Plugin):
         self._translation_enabled = bool(cfg.get("enable_translation", True))
         self._strict = bool(cfg.get("strict", False))
         only = cfg.get("only_packet_ids", None)
-        only_ids = set(int(x) for x in only) if isinstance(only, list) and only else None
-        if only_ids is None:
-            only_ids = ProtocolBridgeCore.known_translate_ids()
+        manual_ids = set(int(x) for x in only) if isinstance(only, list) and only else None
+
+        # 按档位预探测各版本到服务器版本的精确差异包表（启动期一次性开销）。
+        # 老档位(924~1001)到 2225 有 26~40 个不兼容包，远多于 2193 的 7 个；
+        # 单用固定 8 包白名单会导致老档位大量包不翻译。
+        by_proto = {}
+        unsupported = []
+        if self._translation_enabled:
+            for proto in sorted(self._allowed):
+                if proto == self._server_protocol:
+                    continue
+                if manual_ids is not None:
+                    by_proto[proto] = set(manual_ids)  # 用户显式指定则完全遵循
+                    continue
+                ids = ProtocolBridgeCore.probe_required_ids(proto, self._server_protocol)
+                if ids is None:
+                    unsupported.append(proto)  # 如 2169：库不支持，降级为只改协议号
+                    continue
+                by_proto[proto] = ids
+        self._translate_map = by_proto
+        self._probe_count_by_proto = {p: len(v) for p, v in by_proto.items()}
+
         self._core = ProtocolBridgeCore(
             server_protocol=self._server_protocol,
             strict=self._strict,
-            only_ids=only_ids,
+            only_ids=(manual_ids if manual_ids is not None
+                      else ProtocolBridgeCore.known_translate_ids()),  # 兜底
+            only_ids_by_proto=by_proto if by_proto else None,
         )
 
         # 每个地址/subclient 对应的客户端真实协议号（从登录包记录，供翻译用）
@@ -159,13 +180,24 @@ class ProtocolBridgePlugin(Plugin):
         self.register_events(self)
         whitelist = ", ".join(str(p) for p in sorted(self._allowed))
         self.logger.info(
-            "ProtocolBridge v2.0 已启用（完整版：握手准入+包翻译，无需 v1.x）| "
+            "ProtocolBridge v2.0.1 已启用（完整版：握手准入+包翻译，无需 v1.x）| "
             "服务器协议=%d | MC版本=%s | 协议号改写=%s | 进服通报=%s | 包翻译=%s | "
-            "1.26.x白名单=[%s] | 翻译包白名单=%s"
+            "1.26.x白名单=[%s]"
             % (self._server_protocol, self._minecraft_version,
                self._bypass_enabled, self._announce_enabled, self._translation_enabled,
-               whitelist, sorted(only_ids))
+               whitelist)
         )
+        if self._translation_enabled and self._probe_count_by_proto:
+            detail = " | ".join(
+                "%s:%d包" % (_proto_label(p), n)
+                for p, n in sorted(self._probe_count_by_proto.items())
+            )
+            self.logger.info("ProtocolBridge 分档翻译表（各档位→服务器需翻译包数）: " + detail)
+        if unsupported:
+            self.logger.warning(
+                "以下档位不在官方库支持列表，仅改协议号、不翻译包（可正常进服）: %s"
+                % ", ".join("%s(%d)" % (_proto_label(p), p) for p in unsupported)
+            )
         if self._server_protocol not in SUPPORTED_PROTOCOLS:
             self.logger.warning(
                 "服务器协议号 %d 不在官方库支持列表，包翻译可能不可用；"
