@@ -43,4 +43,4 @@ fallback_item_id = 1
   找不到 `protocol_bridge`，已改为相对导入优先，打包后实测可正常加载。
 - 新增回归测试 `test_item_remap.py`（6 项）。全量测试 95 项通过。
 - 产物：`dist/endstone_protocolbridge-3.1.0-py3-none-any.whl`（已打包 config.toml）。
-- 生产服务器当前仍是 v2.0.1，本次改动仅在沙箱验证，未部署。需要部署时再单独操作。
+- 安装：把 whl 放入 `plugins/` 重启即可；首次启动生成含中文注释的 `config.toml`。一次只装一个版本，无需 v1.x 配套。
