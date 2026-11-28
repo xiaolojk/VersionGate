@@ -1,6 +1,6 @@
 # VersionGate / ProtocolBridge v3.1.0 更新说明
 
-本次解决两个问题：方块物品在 1.21 客户端变成空气；玩家可在配置界面自己添加物品 ID 映射。
+本次解决两个问题：方块物品在 1.21 客户端变成空气；服主可自己配置物品 ID 映射。
 
 ## 一、方块物品不再变空气
 
@@ -18,24 +18,22 @@
 - 只改发包方向，收包方向不动，不影响服务端识别。
 - 可用 `enable_item_remap` 开关，`fallback_item_id` 调兜底物品。
 
-## 二、配置界面加"物品 ID 映射"页
+## 二、可自己配置物品 ID 映射
 
-面板 → 插件管理 → ProtocolBridge 配置 → 新增「物品 ID 映射」标签页：
+通过配置文件的 `[item_id_map]` 段设置映射，左边填 1.26 新物品 ID（方块物品填 `block_runtime_id`），右边填 1.21 已有物品 ID。改完重启服务器生效。
 
-- 表格增删，左边填 1.26 新物品 ID（方块物品填 block_runtime_id），右边填 1.21 已有物品 ID。
-- 保存时校验两列必须为正整数；写入配置文件的 `[item_id_map]` 段，重启服务器生效。
-- 「可视化配置」页可开关 `enable_item_remap`、调整 `fallback_item_id`。
+相关配置项（config.toml）：
 
-对应配置项（config.toml，也可手动编辑）：
-
-```
-enable_item_remap = true
-fallback_item_id = 1
+```toml
+enable_item_remap = true   # 是否启用防空气修正
+fallback_item_id = 1       # 方块物品无映射时的兜底 ID，默认 1=石头
 
 [item_id_map]
 20001 = 5      # 例：方块 bri 20001 → 1.21 木板(id=5)
 12345 = 1      # 例：新物品 12345 → 1.21 石头(id=1)
 ```
+
+右边填的 ID 必须是 1.21 客户端确实存在的物品，填错会显示成对应物品；方块物品的 `block_runtime_id` 由服务端动态分配，换世界或加模组后可能需要更新映射。
 
 ## 三、其他
 
