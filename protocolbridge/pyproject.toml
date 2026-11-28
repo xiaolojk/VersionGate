@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone-protocolbridge"
-version = "2.0.0"
-description = "Bedrock 1.26.x cross-version packet translator for Endstone (真正的跨版本包翻译)"
+version = "2.0.1"
+description = "Bedrock 1.26.x cross-version packet translator for Endstone (全档位精确翻译)"
 requires-python = ">=3.12"
 dependencies = ["bedrock-protocol>=0.5.1"]
 
