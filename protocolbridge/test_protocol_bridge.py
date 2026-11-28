@@ -126,3 +126,69 @@ def test_translate_all_common_packets_no_crash():
                 pytest.fail("pid=%d %s 翻译后无法解码: %s" % (pid, C21.__name__, e))
     assert translated > 150, "至少应成功翻译大部分包"
     print("成功翻译并回解: %d/%d" % (translated, len(common)))
+
+
+# ============ v2.0.1 新增：按档位动态翻译白名单测试 ============
+
+def test_probe_required_ids_all_protocols():
+    """各 1.26.x 档位到 2225 的探测表应覆盖全部不兼容包，且老档位 > 2193。"""
+    sizes = {}
+    for proto in (924, 944, 975, 1001, 2168, 2193):
+        ids = ProtocolBridgeCore.probe_required_ids(proto, 2225)
+        assert ids is not None, proto
+        assert 12 in ids and 11 in ids, (proto, ids)  # StartGame/AddPlayer 必在内
+        sizes[proto] = len(ids)
+    # 老档位差异包明显更多，证明固定 8 包白名单确实不够
+    assert sizes[924] > sizes[2193] >= 7, sizes
+    print("各档位需翻译包数:", sizes)
+
+
+def test_probe_required_ids_unsupported_protocol():
+    """库不支持的档位(2169)应返回 None 以便降级。"""
+    assert ProtocolBridgeCore.probe_required_ids(2169, 2225) is None
+
+
+def test_probe_table_translates_all_required_packets():
+    """用探测出的表翻译该档位全部差异包，必须都能被 2225 回解。"""
+    for proto in (924, 1001, 2168, 2193):
+        ids = ProtocolBridgeCore.probe_required_ids(proto, 2225)
+        core = ProtocolBridgeCore(server_protocol=2225, only_ids_by_proto={proto: ids})
+        checked = 0
+        for pid in ids:
+            cls = _packet_class(proto, pid)
+            if cls is None:
+                continue
+            try:
+                data = _module(proto).encode(cls())
+            except Exception:
+                continue  # 默认对象无法编码的包（如 CommandRequest）
+            out = core.translate_receive(pid, data, client_protocol=proto)
+            assert out is not None, (proto, pid)
+            dst = _module(2225).decode(_packet_class(2225, pid), out)
+            assert dst is not None, (proto, pid)
+            checked += 1
+        assert checked > 0, proto
+        print("档位 %d 验证 %d 个差异包全部可翻译回解" % (proto, checked))
+
+
+def test_only_ids_by_proto_precedence():
+    """分档表应优先于全局 only_ids 生效。"""
+    # 全局只放行 pid=1；但分档表指定 12 -> 应能翻译 12
+    core = ProtocolBridgeCore(server_protocol=2225,
+                              only_ids={1},
+                              only_ids_by_proto={2193: {12}})
+    obj = _packet_class(2193, 12)()
+    obj.name = "ByProto"
+    data = _module(2193).encode(obj)
+    out = core.translate_receive(12, data, client_protocol=2193)
+    assert out is not None, "分档表应优先，翻译 pid=12"
+    decoded = _module(2225).decode(_packet_class(2225, 12), out)
+    assert decoded.name == "ByProto"
+
+
+def test_manual_only_ids_still_respected():
+    """用户显式配置 only_packet_ids 时，不在表内的包不应翻译。"""
+    core = ProtocolBridgeCore(server_protocol=2225, only_ids={999})
+    obj = _packet_class(2193, 12)()
+    data = _module(2193).encode(obj)
+    assert core.translate_receive(12, data, client_protocol=2193) is None
