@@ -71,8 +71,10 @@ class DeepTranslator:
     def __init__(self, server_protocol: int = 2225, client_protocol: int = 776,
                  item_id_map: Optional[Dict[int, int]] = None,
                  fallback_item_id: int = 1,
-                 enable_item_remap: bool = False):
+                 enable_item_remap: bool = False,
+                 debug_log: bool = False):
         self.server_protocol = int(server_protocol)
+        self._debug_log = bool(debug_log)
         self.client_protocol = int(client_protocol)
         self.srv_mod = _module(self.server_protocol)
         self.cli_mod = _module(self.client_protocol)
@@ -233,7 +235,12 @@ class DeepTranslator:
         new_id = None
         reason = None
         if src_id == 0 and src_bri > 0:
-            # 方块物品：block_runtime_id 是关键键
+            # 方块物品：block_runtime_id 是关键键（不是 wiki 上的方块数字 ID）
+            # debug 模式打印真实 bri，玩家照此填「替换方块」右边的 1.26 方块 ID 即可命中
+            if self._debug_log:
+                hint = ("已映射→" + str(self.item_id_map[src_bri])) if src_bri in self.item_id_map else "未映射(走兜底)"
+                log.info("[方块ID诊断] 服务端方块物品 block_runtime_id=%s（%s）。若要替换它，请在 config.json 的「替换方块」填：\"1.21显示用的方块id\": \"%s\"",
+                         src_bri, hint, src_bri)
             new_id = self.item_id_map.get(src_bri)
             if new_id is None and self.fallback_item_id > 0:
                 new_id = self.fallback_item_id

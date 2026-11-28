@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone-protocolbridge"
-version = "3.1.0"
+version = "3.2.0"
 description = "Bedrock 1.21.x/1.26.x cross-version deep packet translator with VersionGate item mapping for Endstone"
 requires-python = ">=3.12"
 dependencies = ["bedrock-protocol>=0.5.1"]

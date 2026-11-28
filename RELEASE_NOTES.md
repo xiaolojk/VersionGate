@@ -1,44 +1,32 @@
-# VersionGate / ProtocolBridge v3.1.0 更新说明
+# v3.2.0 发行说明
 
-本次解决两个问题：方块物品在 1.21 客户端变成空气；服主可自己配置物品 ID 映射。
+## 本次更新
 
-## 一、方块物品不再变空气
+- **配置文件改为 JSON**：插件首次启动生成 `config.json`（类 JSON 格式，支持 `#` 行尾注释），替代原 `config.toml`
+- **新增「替换方块」段**：玩家可自行配置方块 ID 替换，格式 `"1.21方块id": "1.26方块id"`（键值统一用英文冒号）
+- **方块 ID 诊断日志**：开启 `debug=true` 后进服，日志会打印服务端方块物品的真实 `block_runtime_id`，照此填写即可命中映射（修复了 debug 开关未传给翻译器导致看不到日志的问题）
+- **保持兼容**：原有 `item_id_map` 写法仍可读取
 
-原因（实测 bedrock-protocol 库确认）：
+## 方块替换配置
 
-- 1.26 服务端的方块物品在物品描述符里是 `id=0 + block_runtime_id=N`。
-- 1.21 老客户端的编码器把 `id=0` 当"空物品"，直接把整个物品清成 6 字节空包，
-  `block_runtime_id` 和数量全部丢弃，所以玩家看到空气。
+在 `plugins/protocolbridge/config.json` 的 `Settings.替换方块` 段填写：
 
-修复：深度翻译发包方向（1.26→1.21）对物品描述符做 ID 修正，保证写回的 `id` 大于 0：
-
-- 方块物品（`id=0 + block_runtime_id`）：优先用玩家映射里的 `block_runtime_id → 物品id`；
-  没配映射就用兜底 ID（默认 1，minecraft:stone），不再变空气。
-- 普通新物品：命中映射时替换为指定的 1.21 物品 ID。
-- 只改发包方向，收包方向不动，不影响服务端识别。
-- 可用 `enable_item_remap` 开关，`fallback_item_id` 调兜底物品。
-
-## 二、可自己配置物品 ID 映射
-
-通过配置文件的 `[item_id_map]` 段设置映射，左边填 1.26 新物品 ID（方块物品填 `block_runtime_id`），右边填 1.21 已有物品 ID。改完重启服务器生效。
-
-相关配置项（config.toml）：
-
-```toml
-enable_item_remap = true   # 是否启用防空气修正
-fallback_item_id = 1       # 方块物品无映射时的兜底 ID，默认 1=石头
-
-[item_id_map]
-20001 = 5      # 例：方块 bri 20001 → 1.21 木板(id=5)
-12345 = 1      # 例：新物品 12345 → 1.21 石头(id=1)
+```json
+"替换方块": {
+  # "1": "12345"    # 1.26 方块 12345 在 1.21 客户端显示为石头(id=1)
+  # "5": "20001"    # 1.26 方块 20001 在 1.21 客户端显示为木板(id=5)
+}
 ```
 
-右边填的 ID 必须是 1.21 客户端确实存在的物品，填错会显示成对应物品；方块物品的 `block_runtime_id` 由服务端动态分配，换世界或加模组后可能需要更新映射。
+- 左边：1.21 客户端确实存在的方块/物品 ID（用来显示）
+- 右边：服务端 1.26 方块的真实 `block_runtime_id`（要被替换的对象）——注意不是 Wiki 上的方块数字 ID
+- 怎么知道右边填什么：把 `debug` 改成 `true` 重启，进服拿起方块，日志会打印 `[方块ID诊断] block_runtime_id=xxxxx`，填这个数即可
+- 没配到的方块物品用 `fallback_item_id`（默认 1 = 石头）兜底，避免变空气
+- 改完重启服务器生效
+- 局限：本替换只作用于背包/物品栏里的方块物品；世界里已摆放的方块走区块调色板，不受影响
 
-## 三、其他
+## 其他
 
-- 修复 v3.0.0 遗留的打包导入问题：`deep_translator.py` 原用绝对导入，装成 wheel 后会
-  找不到 `protocol_bridge`，已改为相对导入优先，打包后实测可正常加载。
-- 新增回归测试 `test_item_remap.py`（6 项）。全量测试 95 项通过。
-- 产物：`dist/endstone_protocolbridge-3.1.0-py3-none-any.whl`（已打包 config.toml）。
-- 安装：把 whl 放入 `plugins/` 重启即可；首次启动生成含中文注释的 `config.toml`。一次只装一个版本，无需 v1.x 配套。
+- 作者：橘子，MIT 开源
+- 104 项自动化测试全过
+- 环境要求：Endstone、Python ≥ 3.12、`bedrock-protocol >= 0.5.1`

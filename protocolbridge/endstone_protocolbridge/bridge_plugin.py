@@ -37,11 +37,13 @@ try:
     from .version_gate import VersionGateConfig, FOLDER_NAME
     from .deep_translator import DeepTranslator
     from .connection_state import ConnectionStateRegistry, CONTEXT_FIELDS
+    from .json_config import ensure_config_json, load_config_json, CONFIG_NAME
 except ImportError:  # 兼容直接运行/测试
     from protocol_bridge import ProtocolBridgeCore, SUPPORTED_PROTOCOLS, _packet_class, _module
     from version_gate import VersionGateConfig, FOLDER_NAME
     from deep_translator import DeepTranslator
     from connection_state import ConnectionStateRegistry, CONTEXT_FIELDS
+    from json_config import ensure_config_json, load_config_json, CONFIG_NAME
 
 # 1.21.x 与 1.26.x 的分界：924 是 1.26.0，以下都是 1.21.x
 # 走深度翻译的最大客户端协议号（含）。924=1.26.0 与 2225 的方块描述符/物品
@@ -146,11 +148,22 @@ class ProtocolBridgePlugin(Plugin):
     api_version = "0.11"
 
     def on_enable(self) -> None:
-        try:
-            self.save_default_config()
-        except Exception as e:
-            self.logger.warning("生成默认配置失败，使用内置默认值: %s" % e)
-        cfg = self.config or {}
+        # 优先从 data_folder 读取 JSON 配置（config.json，支持 # 注释）；
+        # 测试环境无 data_folder 时沿用 self.config（Endstone 注入的 config.toml）。
+        data_folder = getattr(self, "data_folder", None)
+        json_cfg = None
+        if data_folder is not None:
+            try:
+                created = ensure_config_json(data_folder)
+                json_cfg = load_config_json(data_folder)
+                if created and hasattr(self, "logger"):
+                    self.logger.info("已生成 JSON 配置文件: %s（编辑后重启生效）"
+                                     % str(Path(data_folder) / CONFIG_NAME))
+            except Exception as e:
+                if hasattr(self, "logger"):
+                    self.logger.warning("读取 config.json 失败，沿用默认配置: %s" % e)
+                json_cfg = None
+        cfg = json_cfg if json_cfg else (self.config or {})
 
         self._server_protocol = int(self.server.protocol_version)
         self._minecraft_version = str(self.server.minecraft_version)
@@ -185,10 +198,24 @@ class ProtocolBridgePlugin(Plugin):
         self._proto_stats = {}
         self._stats_lock = threading.Lock()
 
-        # ---------- 功能 3b：物品 ID 映射（1.26新id/方块bri → 1.21已有id，防空气）----------
+        # ---------- 功能 3b：方块替换映射（防止方块物品变空气）----------
         self._item_id_map = {}
         self._enable_item_remap = bool(cfg.get("enable_item_remap", True))
         self._fallback_item_id = int(cfg.get("fallback_item_id", 1) or 0)
+
+        # 新格式（config.json 的 [替换方块]）：键为 1.21方块id，值为 1.26方块id。
+        # 即 "1.21id": "1.26id"。翻译器内部需要 {1.26: 1.21}，故这里反转存储。
+        raw_replace = cfg.get("替换方块", None)
+        if isinstance(raw_replace, dict):
+            for k, v in raw_replace.items():
+                try:
+                    id_121, id_126 = int(k), int(v)
+                    if id_121 > 0 and id_126 > 0:
+                        self._item_id_map[id_126] = id_121
+                except Exception:
+                    continue
+
+        # 兼容旧格式 item_id_map（左边 1.26新id，右边 1.21已有id）
         raw_id_map = cfg.get("item_id_map", None)
         if isinstance(raw_id_map, dict):
             for k, v in raw_id_map.items():
@@ -274,6 +301,7 @@ class ProtocolBridgePlugin(Plugin):
                                 item_id_map=self._item_id_map,
                                 fallback_item_id=self._fallback_item_id,
                                 enable_item_remap=self._enable_item_remap,
+                                debug_log=self._debug,
                             )
                     except Exception as e:
                         self.logger.warning("深度翻译器初始化失败 协议%d: %s" % (proto, e))
@@ -296,9 +324,9 @@ class ProtocolBridgePlugin(Plugin):
         remap_state = ("启用(%d条映射,兜底id=%d)" % (len(self._item_id_map), self._fallback_item_id)) \
             if self._enable_item_remap else "关闭"
         self.logger.info(
-            "ProtocolBridge v3.0.0 已启用（握手准入+深度包翻译+VersionGate物品替换+防空气，无需 v1.x）| "
+            "ProtocolBridge v3.2.0 已启用（握手准入+深度包翻译+VersionGate物品替换+防空气，无需 v1.x）| "
             "服务器协议=%d | MC版本=%s | 协议号改写=%s | 进服通报=%s | 包翻译=%s | "
-            "物品名替换=%s | 物品ID映射/防空气=%s | 白名单(1.21.x+1.26.x)=[%s]"
+            "物品名替换=%s | 方块替换/防空气=%s | 白名单(1.21.x+1.26.x)=[%s]"
             % (self._server_protocol, self._minecraft_version,
                self._bypass_enabled, self._announce_enabled, self._translation_enabled,
                vg_state, remap_state, whitelist)
